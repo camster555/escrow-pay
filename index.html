@@ -1,0 +1,494 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Escrow deposit</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root{
+    color-scheme:light dark;
+    /* sensible defaults; overwritten from Telegram themeParams at runtime */
+    --bg:#ffffff;
+    --text:#111111;
+    --hint:#8a8a8e;
+    --link:#2ea6ff;
+    --btn:#2ea6ff;
+    --btn-text:#ffffff;
+    --card:#f4f4f5;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;
+    padding:16px;
+    font:16px/1.5 -apple-system,BlinkMacSystemFont,Roboto,"Segoe UI",Helvetica,Arial,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:460px;margin:0 auto}
+  .card{
+    background:var(--card);
+    border-radius:16px;
+    padding:18px;
+    margin-bottom:14px;
+  }
+  h1{font-size:18px;font-weight:700;margin:0 0 4px}
+  .sub{color:var(--hint);font-size:14px;margin:0 0 16px}
+  .amount{
+    font-size:30px;
+    font-weight:800;
+    letter-spacing:-.5px;
+    margin:2px 0 2px;
+  }
+  .amount small{font-size:16px;font-weight:600;color:var(--hint);margin-left:4px}
+  .label{color:var(--hint);font-size:13px;margin-top:14px}
+  .addr-row{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    margin-top:4px;
+  }
+  .addr{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:15px;
+    font-weight:600;
+  }
+  .copy{
+    border:0;
+    background:transparent;
+    color:var(--link);
+    font-size:13px;
+    font-weight:600;
+    padding:4px 6px;
+    margin:0;
+    width:auto;
+    cursor:pointer;
+    border-radius:8px;
+  }
+  .copy:active{opacity:.6}
+  button.primary{
+    display:block;
+    width:100%;
+    padding:15px;
+    border:0;
+    border-radius:12px;
+    font-size:16px;
+    font-weight:700;
+    margin-top:8px;
+    background:var(--btn);
+    color:var(--btn-text);
+    cursor:pointer;
+  }
+  button.primary:disabled{opacity:.5;cursor:default}
+  button.ghost{
+    display:block;
+    width:100%;
+    padding:14px;
+    border:1px solid var(--hint);
+    border-radius:12px;
+    font-size:15px;
+    font-weight:600;
+    margin-top:10px;
+    background:transparent;
+    color:var(--text);
+    cursor:pointer;
+  }
+  .wallet{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:10px;
+    font-size:14px;
+    color:var(--hint);
+    margin-bottom:6px;
+  }
+  .wallet .val{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-weight:600;
+    color:var(--text);
+  }
+  .status{
+    font-size:14px;
+    margin-top:14px;
+    min-height:20px;
+    word-break:break-word;
+  }
+  .status.ok{color:#1a9d4b}
+  .status.err{color:#d9433b}
+  .warn{
+    background:rgba(217,154,43,.12);
+    border:1px solid rgba(217,154,43,.4);
+    border-radius:10px;
+    padding:10px 12px;
+    font-size:13px;
+    margin-top:12px;
+  }
+  .error-box{
+    background:rgba(217,67,59,.10);
+    border:1px solid rgba(217,67,59,.45);
+    border-radius:12px;
+    padding:16px;
+    font-size:15px;
+  }
+  .spin{
+    display:inline-block;
+    width:14px;height:14px;
+    border:2px solid currentColor;
+    border-right-color:transparent;
+    border-radius:50%;
+    vertical-align:-2px;
+    margin-right:6px;
+    animation:sp .7s linear infinite;
+  }
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .hidden{display:none !important}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- Fatal error (missing params) replaces everything -->
+  <div id="fatal" class="card error-box hidden"></div>
+
+  <!-- Main deposit UI -->
+  <div id="main" class="hidden">
+    <div class="card">
+      <h1>Escrow deposit</h1>
+      <p class="sub">Your USDT goes into this deal's own on-chain vault — it only moves when 2 of 3 (buyer, seller, arbiter) agree.</p>
+
+      <div class="label">You deposit</div>
+      <div class="amount"><span id="amt">—</span><small>USDT</small></div>
+
+      <div class="label">Deal vault</div>
+      <div class="addr-row">
+        <span class="addr" id="vaultShort">—</span>
+        <button class="copy" id="copyVault" type="button">Copy</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div id="walletRow" class="wallet hidden">
+        <span>Wallet</span>
+        <span class="val" id="walletShort">—</span>
+      </div>
+
+      <button id="primaryBtn" class="primary" type="button">Connect wallet</button>
+      <button id="closeBtn" class="ghost hidden" type="button">Close</button>
+
+      <div id="netWarn" class="warn hidden">Switch TronLink to the Nile testnet.</div>
+      <div id="status" class="status"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// =====================================================================
+// Escrow deposit Mini App — TRON Nile testnet, USDT (6 decimals).
+// Self-contained: the only external script is the Telegram WebApp SDK.
+// TronWeb is NOT bundled — we use the window.tronWeb that TronLink injects.
+// =====================================================================
+
+// ---- Embedded constants ----------------------------------------------
+const DEFAULT_TOKEN = "THpmGfSFeQuFdfdUY8JCYyJ8RktsjtrEPj"; // Nile test USDT
+
+// Minimal USDT (TRC20) ABI: approve + balanceOf.
+const USDT_ABI = [
+  {
+    "constant": false,
+    "inputs": [
+      { "name": "spender", "type": "address" },
+      { "name": "value", "type": "uint256" }
+    ],
+    "name": "approve",
+    "outputs": [{ "name": "", "type": "bool" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "constant": true,
+    "inputs": [{ "name": "account", "type": "address" }],
+    "name": "balanceOf",
+    "outputs": [{ "name": "", "type": "uint256" }],
+    "stateMutability": "view",
+    "type": "function"
+  }
+];
+
+// Minimal Escrow (vault) ABI: deposit + a couple of views.
+const ESCROW_ABI = [
+  {
+    "inputs": [{ "name": "amount", "type": "uint256" }],
+    "name": "deposit",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "state",
+    "outputs": [{ "name": "", "type": "uint8" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "balance",
+    "outputs": [{ "name": "", "type": "uint256" }],
+    "stateMutability": "view",
+    "type": "function"
+  }
+];
+
+// ---- Telegram integration --------------------------------------------
+const tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+if (tg) {
+  try { tg.ready(); } catch (e) {}
+  try { tg.expand(); } catch (e) {}
+}
+
+// Apply Telegram theme (falls back to CSS defaults when opened outside Telegram).
+function applyTheme() {
+  const tp = (tg && tg.themeParams) ? tg.themeParams : {};
+  const root = document.documentElement.style;
+  const map = {
+    "--bg":       tp.bg_color,
+    "--text":     tp.text_color,
+    "--hint":     tp.hint_color,
+    "--link":     tp.link_color,
+    "--btn":      tp.button_color,
+    "--btn-text": tp.button_text_color,
+    "--card":     tp.secondary_bg_color
+  };
+  for (const k in map) {
+    if (map[k]) root.setProperty(k, map[k]);
+  }
+  // Match Telegram's overall color scheme (light/dark) for form controls etc.
+  if (tg && tg.colorScheme) {
+    document.documentElement.style.colorScheme = tg.colorScheme;
+  }
+}
+applyTheme();
+if (tg && tg.onEvent) {
+  try { tg.onEvent("themeChanged", applyTheme); } catch (e) {}
+}
+
+// ---- Helpers ----------------------------------------------------------
+function short(a) {
+  if (!a || a.length < 12) return a || "";
+  return a.slice(0, 4) + "…" + a.slice(-4);
+}
+function el(id) { return document.getElementById(id); }
+function setStatus(msg, kind) {
+  const s = el("status");
+  s.className = "status" + (kind ? " " + kind : "");
+  s.innerHTML = msg;
+}
+function fatal(msg) {
+  const f = el("fatal");
+  f.textContent = msg;
+  f.classList.remove("hidden");
+  el("main").classList.add("hidden");
+}
+
+// ---- Read deal params: Telegram deep-link first, else the URL --------
+// The in-card "Pay in wallet" button is a deep link  t.me/<bot>/<app>?startapp=<vault>_<amount>
+// (this is the only kind of Mini-App launch Telegram allows from a GROUP). Telegram hands
+// the payload to us as WebApp.initDataUnsafe.start_param, i.e. the string "<vault>_<amount>".
+// Opening the hosted page directly (desktop TronLink / TronLink's browser) still uses the
+// plain ?vault=...&amount=... query, so both paths work.
+const q = new URLSearchParams(location.search);
+const sp = ((window.Telegram && window.Telegram.WebApp
+             && window.Telegram.WebApp.initDataUnsafe
+             && window.Telegram.WebApp.initDataUnsafe.start_param) || "").trim();
+let vault, amount;
+if (sp) {
+  const i = sp.indexOf("_");                 // vault is base58 (never contains "_"); amount follows
+  vault  = (i >= 0 ? sp.slice(0, i) : sp).trim();
+  amount = (i >= 0 ? sp.slice(i + 1) : "").trim();
+} else {
+  vault  = (q.get("vault")  || "").trim();
+  amount = (q.get("amount") || "").trim();
+}
+const token = (q.get("token") || "").trim() || DEFAULT_TOKEN;
+
+if (!vault || !amount) {
+  fatal("This deposit link is missing its deal details (vault and amount). Please reopen the link the bot gave you.");
+} else if (isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+  fatal("This deposit link has an invalid amount.");
+} else {
+  el("main").classList.remove("hidden");
+  el("amt").textContent = amount;
+  el("vaultShort").textContent = short(vault);
+  el("copyVault").addEventListener("click", () => copyText(vault, "Vault address copied."));
+  el("primaryBtn").textContent = "Connect wallet";
+  el("primaryBtn").addEventListener("click", onPrimary);
+  el("closeBtn").addEventListener("click", () => { if (tg) tg.close(); });
+}
+
+// USDT has 6 decimals.
+const amountUnits = Math.round(parseFloat(amount) * 1e6);
+
+function copyText(text, okMsg) {
+  const done = () => setStatus(okMsg, "ok");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(fallback);
+  } else {
+    fallback();
+  }
+  function fallback() {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      done();
+    } catch (e) {
+      setStatus("Couldn't copy automatically — long-press to copy: " + text, "");
+    }
+  }
+}
+
+// ---- Wallet state -----------------------------------------------------
+let tronWeb = null;
+let connected = false;
+let busy = false;
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Wait until TronLink has injected a ready tronWeb with a default address.
+async function waitForTronWeb(timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const tw = window.tronWeb;
+    if (tw && tw.ready && tw.defaultAddress && tw.defaultAddress.base58) {
+      return tw;
+    }
+    await sleep(150);
+  }
+  return null;
+}
+
+async function connectWallet() {
+  // No TronLink injected at all → plain browser or Telegram mobile WebView.
+  if (!window.tronLink && !window.tronWeb) {
+    setStatus("No TRON wallet found here. Open this in the TronLink app's browser, or use Telegram Desktop with the TronLink extension. (Full in-Telegram mobile support via WalletConnect is coming next.)", "err");
+    return false;
+  }
+
+  setStatus('<span class="spin"></span>Connecting to TronLink…', "");
+
+  // Ask TronLink to expose the account (user approves in the extension/app).
+  if (window.tronLink && window.tronLink.request) {
+    try {
+      await window.tronLink.request({ method: "tron_requestAccounts" });
+    } catch (e) {
+      setStatus("Wallet connection was rejected. Tap Connect wallet to try again.", "err");
+      return false;
+    }
+  }
+
+  // Grab the injected tronWeb and wait until it's ready with an address.
+  tronWeb = window.tronWeb;
+  const ready = await waitForTronWeb(6000);
+  if (!ready) {
+    setStatus("Couldn't reach your wallet. Make sure TronLink is unlocked, then tap Connect wallet again.", "err");
+    return false;
+  }
+  tronWeb = ready;
+
+  const addr = tronWeb.defaultAddress.base58;
+  el("walletShort").textContent = short(addr);
+  el("walletRow").classList.remove("hidden");
+
+  // Warn (non-blocking) if TronLink isn't pointed at the Nile testnet.
+  try {
+    const host = (tronWeb.fullNode && tronWeb.fullNode.host) ? tronWeb.fullNode.host : "";
+    if (host.indexOf("nile") === -1) {
+      el("netWarn").classList.remove("hidden");
+    } else {
+      el("netWarn").classList.add("hidden");
+    }
+  } catch (e) {}
+
+  connected = true;
+  el("primaryBtn").textContent = "Deposit " + amount + " USDT";
+  setStatus("Wallet connected. Tap Deposit to fund the escrow.", "");
+  return true;
+}
+
+// ---- Deposit flow: approve, then deposit ------------------------------
+async function doDeposit() {
+  if (busy) return;
+  busy = true;
+  el("primaryBtn").disabled = true;
+
+  try {
+    // Step 1 — approve the vault to pull `amountUnits` USDT.
+    setStatus('<span class="spin"></span>Approving…', "");
+    const usdt = await tronWeb.contract(USDT_ABI, token);
+    await usdt.approve(vault, amountUnits).send({
+      feeLimit: 100000000,
+      shouldPollResponse: true
+    });
+
+    // Step 2 — deposit into the deal's escrow vault.
+    setStatus('<span class="spin"></span>Depositing…', "");
+    const esc = await tronWeb.contract(ESCROW_ABI, vault);
+    await esc.deposit(amountUnits).send({
+      feeLimit: 300000000,
+      shouldPollResponse: true
+    });
+
+    // Only reached if the deposit tx actually resolved.
+    setStatus("✅ Deposited! The bot will confirm shortly.", "ok");
+    el("primaryBtn").classList.add("hidden");
+    el("closeBtn").classList.remove("hidden");
+    if (tg && tg.HapticFeedback) {
+      try { tg.HapticFeedback.notificationOccurred("success"); } catch (e) {}
+    }
+  } catch (e) {
+    setStatus(readableError(e), "err");
+    busy = false;
+    el("primaryBtn").disabled = false;
+  }
+}
+
+function readableError(e) {
+  let msg = "";
+  if (typeof e === "string") msg = e;
+  else if (e && e.message) msg = e.message;
+  else { try { msg = JSON.stringify(e); } catch (x) { msg = String(e); } }
+
+  const low = (msg || "").toLowerCase();
+  if (low.indexOf("declined") !== -1 || low.indexOf("reject") !== -1 ||
+      low.indexOf("cancel") !== -1 || low.indexOf("denied") !== -1) {
+    return "Transaction cancelled in your wallet. Tap Deposit to try again.";
+  }
+  if (low.indexOf("balance") !== -1 || low.indexOf("insufficient") !== -1) {
+    return "Not enough USDT (or TRX for fees) in your wallet on the Nile testnet.";
+  }
+  if (low.indexOf("revert") !== -1) {
+    return "The deposit was rejected by the contract. This deal may not be open for deposits, or the amount doesn't match. " + msg;
+  }
+  return "Something went wrong: " + msg;
+}
+
+// ---- Primary button router -------------------------------------------
+async function onPrimary() {
+  if (busy) return;
+  if (!connected) {
+    await connectWallet();
+  } else {
+    await doDeposit();
+  }
+}
+</script>
+</body>
+</html>

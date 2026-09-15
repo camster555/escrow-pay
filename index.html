@@ -177,9 +177,11 @@
         <div class="amount"><span id="amt">—</span><small>USDT</small></div>
       </div>
 
-      <!-- vote mode: which outcome this signature approves -->
+      <!-- vote mode: which outcome this signature approves.
+           Close mode reuses this block (the label is rewritten from JS) — it answers
+           the same question: "what is this one signature about to do?" -->
       <div id="voteBlock" class="hidden">
-        <div class="label">You are voting for</div>
+        <div class="label" id="voteLabel">You are voting for</div>
         <div class="vote-what" id="voteWhat">—</div>
       </div>
 
@@ -267,11 +269,23 @@ const USDT_ABI = [
   }
 ];
 
-// Minimal Escrow (vault) ABI: deposit, approve (the settlement vote) + a couple of views.
+// Minimal Escrow (vault) ABI: deposit, approve (the settlement vote), cancel (closing
+// the vault) + a couple of views.
 const ESCROW_ABI = [
   {
     "inputs": [{ "name": "amount", "type": "uint256" }],
     "name": "deposit",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    // cancel() — closes a vault that never received a deposit, permanently. Takes no
+    // arguments. Only the BUYER or the SELLER may call it (NOT the arbiter, so the bot
+    // cannot close a vault for you — which is the whole reason this page has a close
+    // mode), and only while the state is still AwaitingDeposit.
+    "inputs": [],
+    "name": "cancel",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -378,29 +392,48 @@ function fatal(msg) {
 // The "🔏 Sign vote in wallet" button uses the SAME mechanism with one extra tail:
 // <vault>_<amount>_v<mode>  (query form: &vote=<mode>). The tail turns this page into a
 // VOTE page. A payload without it is a deposit link and behaves exactly as it always has.
+//
+// The "🔒 Close vault on-chain" button is the third tail: <vault>_<amount>_c
+// (query form: &close=1). It turns this page into a CLOSE page, which calls cancel() on
+// the vault. The tails are unambiguous because an amount is digits and "-" only.
 const q = new URLSearchParams(location.search);
 const sp = ((window.Telegram && window.Telegram.WebApp
              && window.Telegram.WebApp.initDataUnsafe
              && window.Telegram.WebApp.initDataUnsafe.start_param) || "").trim();
-let vault, amount, voteMode;
+let vault, amount, voteMode, closeFlag;
 if (sp) {
   const i = sp.indexOf("_");                 // vault is base58 (never contains "_"); amount follows
   vault  = (i >= 0 ? sp.slice(0, i) : sp).trim();
   let rest = (i >= 0 ? sp.slice(i + 1) : "").trim();
-  const v = rest.lastIndexOf("_v");          // optional vote tail; the amount is digits + "-" only
-  if (v >= 0) {
-    voteMode = rest.slice(v + 2).trim();
-    rest = rest.slice(0, v);
+  // Optional close tail, checked first (a close payload never carries a vote too).
+  // It matches both "<amount>_c" and a bare "c" — splitting on the FIRST "_" means a
+  // payload with no amount at all ("<vault>_c") arrives here as just "c". An amount is
+  // digits and "-" only, so a trailing "c" can never be part of one.
+  const ct = /(^|_)c$/.exec(rest);
+  if (ct) {
+    closeFlag = "1";
+    rest = rest.slice(0, ct.index);
+  } else {
+    const v = rest.lastIndexOf("_v");        // optional vote tail
+    if (v >= 0) {
+      voteMode = rest.slice(v + 2).trim();
+      rest = rest.slice(0, v);
+    }
   }
   // startapp can't carry a "."; the bot sent a decimal amount's point as "-", so restore it.
   amount = rest.replace(/-/g, ".");
 } else {
-  vault    = (q.get("vault")  || "").trim();
-  amount   = (q.get("amount") || "").trim();
-  voteMode = (q.get("vote")   || "").trim();
+  vault     = (q.get("vault")  || "").trim();
+  amount    = (q.get("amount") || "").trim();
+  voteMode  = (q.get("vote")   || "").trim();
+  closeFlag = (q.get("close")  || "").trim();
 }
 const token = (q.get("token") || "").trim() || DEFAULT_TOKEN;
 
+// The three jobs are mutually exclusive. A close link carries no vote, so an ambiguous
+// link (both flags) is treated as a vote — the safer reading, since closing is the only
+// one of the two that destroys something.
+const isClose = !!closeFlag && closeFlag !== "0" && !voteMode;
 // Vote mode only when the link really carries one of the three contract modes.
 const isVote = !!voteMode && Object.prototype.hasOwnProperty.call(VOTE_LABEL, voteMode);
 
@@ -408,13 +441,24 @@ if (!vault) {
   fatal("This link is missing its deal details (the vault address). Please reopen the link the bot gave you.");
 } else if (voteMode && !isVote) {
   fatal("This settlement link has an invalid vote. Please reopen the link the bot gave you.");
-} else if (!isVote && !amount) {
+} else if (!isVote && !isClose && !amount) {
   fatal("This deposit link is missing its deal details (vault and amount). Please reopen the link the bot gave you.");
-} else if (!isVote && (isNaN(parseFloat(amount)) || parseFloat(amount) <= 0)) {
+} else if (!isVote && !isClose && (isNaN(parseFloat(amount)) || parseFloat(amount) <= 0)) {
   fatal("This deposit link has an invalid amount.");
 } else {
   el("main").classList.remove("hidden");
-  if (isVote) {
+  if (isClose) {
+    // Same card, third job: no amount changes hands, so show what the signature DOES.
+    document.title = "Close escrow vault";
+    el("cardTitle").textContent = "Close escrow vault";
+    el("cardSub").textContent = "Closing permanently stops this deal's vault from accepting "
+      + "deposits — nothing must ever be sent to the address afterwards, because it could "
+      + "not be credited or recovered by anyone.";
+    el("depositBlock").classList.add("hidden");
+    el("voteBlock").classList.remove("hidden");
+    el("voteLabel").textContent = "You are about to";
+    el("voteWhat").textContent = "Close this deal's vault for good";
+  } else if (isVote) {
     // Same card, different job: show the OUTCOME being approved instead of an amount.
     document.title = "Escrow settlement";
     el("cardTitle").textContent = "Escrow settlement";
@@ -442,6 +486,7 @@ const amountUnits = amount ? Math.round(parseFloat(amount) * 1e6) : 0;
 
 // What the primary button does once a wallet is connected.
 function actionLabel() {
+  if (isClose) return "Close the vault";
   return isVote ? VOTE_BTN[voteMode] : ("Deposit " + amount + " USDT");
 }
 
@@ -478,20 +523,36 @@ async function readVaultState() {
 //   deposit: Settled(2) / Cancelled(3) are dead vaults.
 //   vote:    same, PLUS AwaitingDeposit(0) — approve() requires Active, and there is
 //            nothing in the vault to release anyway.
+//   close:   ONLY AwaitingDeposit(0) works — cancel() requires it. Active(1) means the
+//            vault holds money, and closing it would strand that money for good, so it
+//            is blocked here as well as by the contract.
+function whatIsImpossible() {
+  if (isVote)  return "there is nothing left to vote on.";
+  if (isClose) return "there is nothing left to close.";
+  return "do not send funds to it.";
+}
+
 function blockedReason(st) {
   if (st === 2) {
-    return "This deal has already been settled — "
-         + (isVote ? "there is nothing left to vote on." : "do not send funds to it.")
+    return "This deal has already been settled — " + whatIsImpossible()
          + " Open the most recent message in your chat instead.";
   }
   if (st === 3) {
-    return "This deal has been cancelled — "
-         + (isVote ? "there is nothing left to vote on." : "do not send funds to it.")
-         + " Open the most recent message in your chat instead.";
+    return isClose
+      ? "This deal's vault is already closed — nothing more to do here. "
+      + "Never send anything to this address."
+      : "This deal has been cancelled — " + whatIsImpossible()
+      + " Open the most recent message in your chat instead.";
   }
   if (isVote && st === 0) {
     return "Nothing has been deposited into this deal yet, so there is nothing to release. "
          + "Once the buyer has paid in, vote again from the chat.";
+  }
+  if (isClose && st === 1) {
+    return "This deal has funds in it, so it cannot be closed — closing would lock that "
+         + "money in the vault for good, out of reach of everyone. Settle it instead: "
+         + "both sides pick “Return each own” under Settle and each side gets its own "
+         + "money back.";
   }
   return null;
 }
@@ -505,7 +566,7 @@ async function checkVaultState() {
   const blocked = blockedReason(vaultState);
   if (blocked) {
     fatal(blocked);                    // dead vault -- block it outright
-  } else if (!isVote && vaultState === 1) {
+  } else if (!isVote && !isClose && vaultState === 1) {
     setStatus("Note: this deal already has a deposit recorded. "
               + "Only continue if you meant to add more.", "");
   }
@@ -617,8 +678,9 @@ async function connectWallet() {
 
   connected = true;
   el("primaryBtn").textContent = actionLabel();
-  setStatus(isVote ? "Wallet connected. Tap to sign your vote."
-                   : "Wallet connected. Tap Deposit to fund the escrow.", "");
+  setStatus(isClose ? "Wallet connected. Tap to close this deal's vault."
+                    : isVote ? "Wallet connected. Tap to sign your vote."
+                             : "Wallet connected. Tap Deposit to fund the escrow.", "");
   return true;
 }
 
@@ -722,6 +784,37 @@ async function doVote() {
   }
 }
 
+// ---- Close flow: one cancel() call on the vault -----------------------
+// Same connected wallet and the same send path as the vote, with no arguments at all.
+// This page exists because the SIGNATURE has to be the buyer's or the seller's:
+// Escrow.cancel() rejects the arbiter, so the bot can never close a vault for them.
+// The contract also requires AwaitingDeposit — guardState() has already checked that,
+// so the user isn't paying gas to learn it.
+async function doClose() {
+  if (busy) return;
+  busy = true;
+  el("primaryBtn").disabled = true;
+
+  try {
+    if (!(await guardState())) { busy = false; return; }
+
+    setStatus('<span class="spin"></span>Closing the vault… (confirm in your wallet)', "");
+    await sendInjected(vault, "cancel()", [], 300000000);
+
+    setStatus("✅ Vault closed on-chain. It can never accept another deposit — do not send "
+              + "anything to this address, ever. The bot will confirm in your chat.", "ok");
+    el("primaryBtn").classList.add("hidden");
+    el("closeBtn").classList.remove("hidden");
+    if (tg && tg.HapticFeedback) {
+      try { tg.HapticFeedback.notificationOccurred("success"); } catch (e) {}
+    }
+  } catch (e) {
+    setStatus(readableError(e), "err");
+    busy = false;
+    el("primaryBtn").disabled = false;
+  }
+}
+
 function readableError(e) {
   let msg = "";
   if (typeof e === "string") msg = e;
@@ -729,6 +822,9 @@ function readableError(e) {
   else { try { msg = JSON.stringify(e); } catch (x) { msg = String(e); } }
 
   const low = (msg || "").toLowerCase();
+  // vote and close both sign a plain call (no USDT moves, only a TRX fee), so they share
+  // most of the wording; only the deposit path talks about amounts and allowances.
+  const noMoney = isVote || isClose;
   if (low.indexOf("dynamically imported") !== -1 || low.indexOf("failed to fetch") !== -1) {
     return "Couldn't load WalletConnect (network blocked or offline). Try “Open in TronLink app” instead.";
   }
@@ -736,22 +832,27 @@ function readableError(e) {
   // screen and typing a password can outlast it, and the wallet then refuses to broadcast.
   // Nothing was signed, spent or lost -- it just has to be built again.
   if (low.indexOf("expired") !== -1 || low.indexOf("expiration") !== -1) {
-    return (isVote ? "Took too long to confirm, so the transaction expired before it was sent. "
-                   + "Nothing was signed or charged — tap the button again"
-                   : "Took too long to confirm, so the transaction expired before it was sent. "
-                   + "Nothing was signed or charged — tap Deposit again")
+    return (noMoney ? "Took too long to confirm, so the transaction expired before it was sent. "
+                    + "Nothing was signed or charged — tap the button again"
+                    : "Took too long to confirm, so the transaction expired before it was sent. "
+                    + "Nothing was signed or charged — tap Deposit again")
          + ", and confirm in your wallet within about a minute (have your password ready).";
   }
   if (low.indexOf("declined") !== -1 || low.indexOf("reject") !== -1 ||
       low.indexOf("cancel") !== -1 || low.indexOf("denied") !== -1) {
-    return isVote ? "Transaction cancelled in your wallet. Tap the button to sign again."
-                  : "Transaction cancelled in your wallet. Tap Deposit to try again.";
+    return noMoney ? "Transaction cancelled in your wallet. Tap the button to try again."
+                   : "Transaction cancelled in your wallet. Tap Deposit to try again.";
   }
   if (low.indexOf("balance") !== -1 || low.indexOf("insufficient") !== -1) {
-    return isVote ? "Not enough TRX in this wallet to pay the Nile network fee."
-                  : "Not enough USDT (or TRX for fees) in your wallet on the Nile testnet.";
+    return noMoney ? "Not enough TRX in this wallet to pay the Nile network fee."
+                   : "Not enough USDT (or TRX for fees) in your wallet on the Nile testnet.";
   }
   if (low.indexOf("revert") !== -1) {
+    if (isClose) {
+      return "The contract refused to close this vault. Only the buyer or the seller can "
+           + "close it, and only while nothing has been deposited — if money has arrived, "
+           + "settle the deal instead. " + msg;
+    }
     if (isVote) {
       return "The vote was rejected by the contract. This deal may already be settled, or "
            + "this wallet isn't one of its three parties (buyer, seller, arbiter). " + msg;
@@ -762,11 +863,12 @@ function readableError(e) {
 }
 
 // ---- Primary button router -------------------------------------------
-// Connecting is identical for both modes; only the signed call differs, so the
+// Connecting is identical for all three modes; only the signed call differs, so the
 // wallet plumbing below is shared and this is the single fork.
 async function runAction() {
-  if (isVote) await doVote();
-  else        await doDeposit();
+  if (isClose)     await doClose();
+  else if (isVote) await doVote();
+  else             await doDeposit();
 }
 
 async function onPrimary() {
@@ -854,8 +956,9 @@ async function startWalletConnect() {
     wcProvider = await UniversalProvider.init({
       projectId: WC_PROJECT_ID,
       metadata: {
-        name: isVote ? "Escrow settlement" : "Escrow deposit",
-        description: isVote ? "TRON Nile escrow settlement vote" : "TRON Nile escrow deposit",
+        name: isClose ? "Close escrow vault" : isVote ? "Escrow settlement" : "Escrow deposit",
+        description: isClose ? "TRON Nile escrow vault closure"
+                   : isVote ? "TRON Nile escrow settlement vote" : "TRON Nile escrow deposit",
         url: window.location.origin,           // must match the page origin
         icons: [window.location.origin + "/icon.png"]
       }
@@ -916,8 +1019,26 @@ async function showWcPairing(uri, QRCode) {
 // Same fork as runAction(), on the WalletConnect side: build → sign → broadcast is
 // shared (wcBuildTrigger / wcSignBroadcastConfirm), only the call differs.
 async function wcRunAction() {
-  if (isVote) await wcRunVote();
-  else        await wcRunDeposit();
+  if (isClose)     await wcRunClose();
+  else if (isVote) await wcRunVote();
+  else             await wcRunDeposit();
+}
+
+// One cancel() call, signed over WalletConnect and broadcast by us. No arguments.
+async function wcRunClose() {
+  if (!(await guardState())) return;
+
+  setStatus('<span class="spin"></span>Closing the vault…', "");
+  const closeTx = await wcBuildTrigger(vault, "cancel()", []);
+  await wcSignBroadcastConfirm(closeTx);
+
+  setStatus("✅ Vault closed on-chain. It can never accept another deposit — do not send "
+            + "anything to this address, ever. The bot will confirm in your chat.", "ok");
+  el("wcCard").classList.add("hidden");
+  el("closeBtn").classList.remove("hidden");
+  if (tg && tg.HapticFeedback) {
+    try { tg.HapticFeedback.notificationOccurred("success"); } catch (e) {}
+  }
 }
 
 // One approve(uint8) call, signed over WalletConnect and broadcast by us.
@@ -1037,13 +1158,14 @@ async function wcWaitConfirm(txid) {
 
 // "Open in wallet app": load THIS deal inside a wallet's own dApp browser, where
 // the injected path just works. The link carries the deal as query params so the
-// page over there reads ?vault=&amount=(&vote=) exactly like a desktop open --
-// the vote MUST come along, or the wallet's browser would show a deposit page.
+// page over there reads ?vault=&amount=(&vote=|&close=1) exactly like a desktop open --
+// the mode MUST come along, or the wallet's browser would show a deposit page.
 function openInWalletApp() {
   const base = window.location.origin + window.location.pathname;
   let target = base + "?vault=" + encodeURIComponent(vault);
   if (amount) target += "&amount=" + encodeURIComponent(amount);
   if (isVote) target += "&vote=" + encodeURIComponent(voteMode);
+  if (isClose) target += "&close=1";
   if (token && token !== DEFAULT_TOKEN) target += "&token=" + encodeURIComponent(token);
 
   // TronLink deep link (docs.tronlink.org/mobile/deeplink): action "open" with a dApp url.

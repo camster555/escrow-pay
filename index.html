@@ -3,6 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- Never serve a stale copy. Wallet in-app browsers (TronLink/TokenPocket) and the
+     Telegram webview cache aggressively; a user must always get the current deposit
+     page, never a previously-loaded version. -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Escrow deposit</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
@@ -362,10 +368,55 @@ if (!vault || !amount) {
   el("closeBtn").addEventListener("click", () => { if (tg) tg.close(); });
   el("wcConnectBtn").addEventListener("click", startWalletConnect);
   el("wcOpenAppBtn").addEventListener("click", openInWalletApp);
+  checkVaultState();           // is this deal still open? (stale-link guard)
 }
 
 // USDT has 6 decimals.
 const amountUnits = Math.round(parseFloat(amount) * 1e6);
+
+// ---- Stale-link guard -------------------------------------------------
+// A chat accumulates a deposit card per deal, so someone can scroll up and open an
+// OLD one -- or leave this page open while the deal gets settled/cancelled. The
+// contract would reject that deposit anyway, but the user would just see a confusing
+// "rejected" error AFTER paying gas. So we read the vault's live state up front (and
+// again right before depositing) and say plainly what's going on.
+// Read-only via TronGrid's REST API: no wallet, no library, works before connecting.
+const VAULT_STATE = ["AwaitingDeposit", "Active", "Settled", "Cancelled"];
+let vaultState = null;
+
+async function readVaultState() {
+  const res = await fetch("https://nile.trongrid.io/wallet/triggerconstantcontract", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      owner_address: vault,            // any address works for a view call
+      contract_address: vault,
+      function_selector: "state()",
+      visible: true
+    })
+  });
+  const j = await res.json();
+  const hex = j && j.constant_result && j.constant_result[0];
+  if (!hex) throw new Error("no result");
+  return parseInt(hex, 16);
+}
+
+async function checkVaultState() {
+  try {
+    vaultState = await readVaultState();
+  } catch (e) {
+    return;                            // network hiccup: stay silent, don't block paying
+  }
+  if (vaultState === 2 || vaultState === 3) {
+    // finished deal -- block it outright so nobody pays into a dead vault
+    const what = vaultState === 2 ? "already been settled" : "been cancelled";
+    fatal("This deal has " + what + " — do not send funds to it. "
+          + "Open the most recent deposit message in your chat instead.");
+  } else if (vaultState === 1) {
+    setStatus("Note: this deal already has a deposit recorded. "
+              + "Only continue if you meant to add more.", "");
+  }
+}
 
 function copyText(text, okMsg) {
   const done = () => setStatus(okMsg, "ok");
@@ -466,6 +517,20 @@ async function doDeposit() {
   el("primaryBtn").disabled = true;
 
   try {
+    // Re-check the deal is still open: the page may have sat open (or been reopened
+    // from an OLD chat message) while the deal got settled or cancelled. Better to
+    // stop here than to pay gas for a transaction the contract will reject.
+    try {
+      const st = await readVaultState();
+      if (st === 2 || st === 3) {
+        fatal("This deal has " + (st === 2 ? "already been settled" : "been cancelled")
+              + " — do not send funds to it. Open the most recent deposit message "
+              + "in your chat instead.");
+        busy = false;
+        return;
+      }
+    } catch (e) { /* network hiccup -- fall through and let the contract decide */ }
+
     // Step 1 — approve the vault to pull `amountUnits` USDT.
     setStatus('<span class="spin"></span>Approving…', "");
     // amountUnits as a STRING: the canonical form for uint256 in TronWeb -- a raw JS

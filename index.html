@@ -226,9 +226,12 @@
 const DEFAULT_TOKEN = "THpmGfSFeQuFdfdUY8JCYyJ8RktsjtrEPj"; // Nile test USDT
 
 // Minimal USDT (TRC20) ABI: approve + balanceOf.
+// NOTE: no legacy "constant" field. With it, TronWeb routes these calls through its OLD
+// parameter encoder, which mangled the uint256 amount (25000000 was encoded as 25 -- a
+// real bug seen on Nile: approve succeeded for 25 raw units, so deposit then REVERTed).
+// Matching ESCROW_ABI's modern shape keeps both on the same (correct) encoder.
 const USDT_ABI = [
   {
-    "constant": false,
     "inputs": [
       { "name": "spender", "type": "address" },
       { "name": "value", "type": "uint256" }
@@ -239,7 +242,6 @@ const USDT_ABI = [
     "type": "function"
   },
   {
-    "constant": true,
     "inputs": [{ "name": "account", "type": "address" }],
     "name": "balanceOf",
     "outputs": [{ "name": "", "type": "uint256" }],
@@ -466,8 +468,10 @@ async function doDeposit() {
   try {
     // Step 1 — approve the vault to pull `amountUnits` USDT.
     setStatus('<span class="spin"></span>Approving…', "");
+    // amountUnits as a STRING: the canonical form for uint256 in TronWeb -- a raw JS
+    // Number can be mis-encoded (and loses precision above 2^53).
     const usdt = await tronWeb.contract(USDT_ABI, token);
-    await usdt.approve(vault, amountUnits).send({
+    await usdt.approve(vault, String(amountUnits)).send({
       feeLimit: 100000000,
       shouldPollResponse: true
     });
@@ -475,7 +479,7 @@ async function doDeposit() {
     // Step 2 — deposit into the deal's escrow vault.
     setStatus('<span class="spin"></span>Depositing…', "");
     const esc = await tronWeb.contract(ESCROW_ABI, vault);
-    await esc.deposit(amountUnits).send({
+    await esc.deposit(String(amountUnits)).send({
       feeLimit: 300000000,
       shouldPollResponse: true
     });

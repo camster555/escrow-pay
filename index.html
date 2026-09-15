@@ -623,6 +623,34 @@ async function connectWallet() {
 }
 
 // ---- Deposit flow: approve, then deposit ------------------------------
+// How long a built transaction stays valid before the network refuses it. TronWeb
+// stamps 60s by default, which is measured from BUILD time -- so reading the wallet
+// screen and typing a password can blow the window ("Transaction expired") even though
+// nothing is wrong. 10 minutes is plenty for a human on a phone.
+const TX_EXPIRY_SECONDS = 600;
+
+async function sendInjected(contractAddr, funcSig, params, feeLimit) {
+  /* Build -> extend the expiry -> sign -> broadcast, instead of contract().send(),
+     which builds and signs in one step and gives us no chance to extend it. Falls back
+     to the plain .send() path if this TronWeb build has no extendExpiration. */
+  const tb = tronWeb.transactionBuilder;
+  const owner = tronWeb.defaultAddress && tronWeb.defaultAddress.base58;
+  if (!owner) throw new Error("Wallet not connected");
+  const built = await tb.triggerSmartContract(
+    contractAddr, funcSig, { feeLimit: feeLimit, callValue: 0 }, params, owner);
+  if (!built || !built.result || !built.result.result) throw new Error("Failed to build transaction");
+  let tx = built.transaction;
+  if (typeof tb.extendExpiration === "function") {
+    try { tx = await tb.extendExpiration(tx, TX_EXPIRY_SECONDS); } catch (e) { /* keep default */ }
+  }
+  const signed = await tronWeb.trx.sign(tx);
+  const res = await tronWeb.trx.sendRawTransaction(signed);
+  if (res && res.code && !wcIsDup(res)) throw new Error(JSON.stringify(res));
+  const txid = (res && (res.txid || (res.transaction && res.transaction.txID))) || tx.txID;
+  await wcWaitConfirm(txid);            // wait for it to actually be mined
+  return txid;
+}
+
 async function doDeposit() {
   if (busy) return;
   busy = true;
@@ -633,22 +661,19 @@ async function doDeposit() {
     if (!(await guardState())) { busy = false; return; }
 
     // Step 1 — approve the vault to pull `amountUnits` USDT.
-    setStatus('<span class="spin"></span>Approving…', "");
     // amountUnits as a STRING: the canonical form for uint256 in TronWeb -- a raw JS
     // Number can be mis-encoded (and loses precision above 2^53).
-    const usdt = await tronWeb.contract(USDT_ABI, token);
-    await usdt.approve(vault, String(amountUnits)).send({
-      feeLimit: 100000000,
-      shouldPollResponse: true
-    });
+    setStatus('<span class="spin"></span>Approving… (confirm in your wallet)', "");
+    await sendInjected(token, "approve(address,uint256)", [
+      { type: "address", value: vault },
+      { type: "uint256", value: String(amountUnits) }
+    ], 100000000);
 
     // Step 2 — deposit into the deal's escrow vault.
-    setStatus('<span class="spin"></span>Depositing…', "");
-    const esc = await tronWeb.contract(ESCROW_ABI, vault);
-    await esc.deposit(String(amountUnits)).send({
-      feeLimit: 300000000,
-      shouldPollResponse: true
-    });
+    setStatus('<span class="spin"></span>Depositing… (confirm in your wallet)', "");
+    await sendInjected(vault, "deposit(uint256)", [
+      { type: "uint256", value: String(amountUnits) }
+    ], 300000000);
 
     // Only reached if the deposit tx actually resolved.
     setStatus("✅ Deposited! The bot will confirm shortly.", "ok");
@@ -676,14 +701,12 @@ async function doVote() {
   try {
     if (!(await guardState())) { busy = false; return; }
 
-    setStatus('<span class="spin"></span>Signing your vote…', "");
+    setStatus('<span class="spin"></span>Signing your vote… (confirm in your wallet)', "");
     // The mode goes over as a STRING for exactly the reason the deposit amount does
     // (see the note on USDT_ABI): a raw JS Number can be mis-encoded by TronWeb.
-    const esc = await tronWeb.contract(ESCROW_ABI, vault);
-    await esc.approve(String(voteMode)).send({
-      feeLimit: 300000000,
-      shouldPollResponse: true
-    });
+    await sendInjected(vault, "approve(uint8)", [
+      { type: "uint8", value: String(voteMode) }
+    ], 300000000);
 
     setStatus("✅ Vote signed on-chain. Once 2 of 3 agree, the vault pays out by itself "
               + "— the bot posts the result in your chat.", "ok");
@@ -708,6 +731,16 @@ function readableError(e) {
   const low = (msg || "").toLowerCase();
   if (low.indexOf("dynamically imported") !== -1 || low.indexOf("failed to fetch") !== -1) {
     return "Couldn't load WalletConnect (network blocked or offline). Try “Open in TronLink app” instead.";
+  }
+  // TRON stamps every transaction with a ~60s expiry AT BUILD TIME. Reading the wallet
+  // screen and typing a password can outlast it, and the wallet then refuses to broadcast.
+  // Nothing was signed, spent or lost -- it just has to be built again.
+  if (low.indexOf("expired") !== -1 || low.indexOf("expiration") !== -1) {
+    return (isVote ? "Took too long to confirm, so the transaction expired before it was sent. "
+                   + "Nothing was signed or charged — tap the button again"
+                   : "Took too long to confirm, so the transaction expired before it was sent. "
+                   + "Nothing was signed or charged — tap Deposit again")
+         + ", and confirm in your wallet within about a minute (have your password ready).";
   }
   if (low.indexOf("declined") !== -1 || low.indexOf("reject") !== -1 ||
       low.indexOf("cancel") !== -1 || low.indexOf("denied") !== -1) {

@@ -143,6 +143,11 @@
     animation:sp .7s linear infinite;
   }
   @keyframes sp{to{transform:rotate(360deg)}}
+  /* WalletConnect fallback UI (matches the card/button look above) */
+  #wcQr{width:220px;height:220px;border-radius:12px;background:#fff;padding:8px;margin:6px auto 0;display:block}
+  .wc-center{text-align:center}
+  .linkrow{display:flex;gap:8px;align-items:flex-start;margin-top:4px}
+  .linkrow .lk{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;word-break:break-all;flex:1}
   .hidden{display:none !important}
 </style>
 </head>
@@ -179,6 +184,32 @@
 
       <div id="netWarn" class="warn hidden">Switch TronLink to the Nile testnet.</div>
       <div id="status" class="status"></div>
+    </div>
+
+    <!-- No injected wallet (e.g. Telegram's plain mobile webview): WalletConnect
+         + "open in wallet app" options. Hidden until the user taps Connect wallet
+         and no window.tronLink / window.tronWeb is found. -->
+    <div id="wcCard" class="card hidden">
+      <div class="label" style="margin-top:0">Connect a wallet</div>
+      <p class="sub" style="margin:6px 0 12px">No TRON wallet extension in this browser. Use WalletConnect with a mobile wallet, or open this deal inside your wallet's own dApp browser.</p>
+
+      <button id="wcConnectBtn" class="primary" type="button">Connect via WalletConnect</button>
+      <button id="wcOpenAppBtn" class="ghost" type="button">Open in TronLink app</button>
+
+      <div id="wcPairing" class="wc-center hidden">
+        <img id="wcQr" alt="WalletConnect QR code">
+        <div class="sub" style="margin:8px 0 6px">Scan with TronLink or TokenPocket</div>
+        <button id="wcCopyBtn" class="ghost" type="button">Copy connection link</button>
+        <button id="wcOpenLinkBtn" class="ghost" type="button">Open in wallet app</button>
+      </div>
+
+      <div id="wcOpenApp" class="hidden">
+        <div class="sub" style="margin:12px 0 6px">Copy this link, then open it inside your TronLink or TokenPocket dApp browser:</div>
+        <div class="linkrow">
+          <span class="lk" id="wcDeepLink"></span>
+          <button class="copy" id="wcCopyDeepLink" type="button">Copy</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -307,7 +338,8 @@ let vault, amount;
 if (sp) {
   const i = sp.indexOf("_");                 // vault is base58 (never contains "_"); amount follows
   vault  = (i >= 0 ? sp.slice(0, i) : sp).trim();
-  amount = (i >= 0 ? sp.slice(i + 1) : "").trim();
+  // startapp can't carry a "."; the bot sent a decimal amount's point as "-", so restore it.
+  amount = (i >= 0 ? sp.slice(i + 1) : "").trim().replace(/-/g, ".");
 } else {
   vault  = (q.get("vault")  || "").trim();
   amount = (q.get("amount") || "").trim();
@@ -326,6 +358,8 @@ if (!vault || !amount) {
   el("primaryBtn").textContent = "Connect wallet";
   el("primaryBtn").addEventListener("click", onPrimary);
   el("closeBtn").addEventListener("click", () => { if (tg) tg.close(); });
+  el("wcConnectBtn").addEventListener("click", startWalletConnect);
+  el("wcOpenAppBtn").addEventListener("click", openInWalletApp);
 }
 
 // USDT has 6 decimals.
@@ -467,6 +501,9 @@ function readableError(e) {
   else { try { msg = JSON.stringify(e); } catch (x) { msg = String(e); } }
 
   const low = (msg || "").toLowerCase();
+  if (low.indexOf("dynamically imported") !== -1 || low.indexOf("failed to fetch") !== -1) {
+    return "Couldn't load WalletConnect (network blocked or offline). Try “Open in TronLink app” instead.";
+  }
   if (low.indexOf("declined") !== -1 || low.indexOf("reject") !== -1 ||
       low.indexOf("cancel") !== -1 || low.indexOf("denied") !== -1) {
     return "Transaction cancelled in your wallet. Tap Deposit to try again.";
@@ -484,10 +521,272 @@ function readableError(e) {
 async function onPrimary() {
   if (busy) return;
   if (!connected) {
-    await connectWallet();
+    // Injected wallet present (desktop TronLink extension, or a wallet's own
+    // in-app browser) → keep the existing injected flow, completely unchanged.
+    if (window.tronLink || window.tronWeb) {
+      await connectWallet();
+    } else {
+      // No injected wallet (e.g. Telegram's plain mobile webview) → offer
+      // WalletConnect + "open in wallet app" instead of the old dead-end error.
+      showWalletOptions();
+    }
   } else {
     await doDeposit();
   }
+}
+
+// =====================================================================
+// WalletConnect fallback — used ONLY when NO wallet is injected.
+// The libraries load on demand via dynamic import() from esm.sh, so the
+// injected path above never depends on the CDN being reachable. Verified
+// versions: universal-provider@2.25.0, tronweb@6.5.0, qrcode@1.5.4.
+// WalletConnect only SIGNS: we build the unsigned tx with a read-only
+// TronWeb pointed at a Nile node, ask the wallet to sign it, then broadcast
+// it ourselves with tronWeb.trx.sendRawTransaction.
+// =====================================================================
+const WC_PROJECT_ID = "c8c7eb9d27340fb9c15e230e8276be6d";
+const WC_NILE_CAIP2 = "tron:0xcd8690dc";   // TRON Nile CAIP-2 (from tronweb3/walletconnect-tron utils.ts)
+const WC_NILE_HEX   = "0xcd8690dc";
+const WC_NILE_HOST  = "https://nile.trongrid.io";
+const WC_FEE_LIMIT  = 150000000;            // 150 TRX cap (Nile TRX is free from the faucet)
+
+let wcProvider = null;   // UniversalProvider instance
+let wcAddress  = null;   // connected base58 address
+let wcReadTron = null;   // read-only TronWeb: builds unsigned txs + broadcasts
+let wcBusy     = false;
+
+function wcSetBtns(disabled) {
+  const a = el("wcConnectBtn"), b = el("wcOpenAppBtn");
+  if (a) a.disabled = disabled;
+  if (b) b.disabled = disabled;
+}
+
+// Reveal the WalletConnect / open-in-app options (replaces the old red
+// "no wallet found" dead end for the no-injected case).
+function showWalletOptions() {
+  el("primaryBtn").classList.add("hidden");   // the generic "Connect wallet" button isn't useful here
+  el("wcCard").classList.remove("hidden");
+  setStatus("No TRON wallet detected in this browser. Connect one below.", "");
+}
+
+async function loadWcLibs() {
+  const [wcMod, twMod, qrMod] = await Promise.all([
+    // ?bundle inlines transitive deps (e.g. tronweb's bignumber.js) into one file --
+    // without it esm.sh serves them as separate modules whose named exports don't
+    // resolve ("does not provide an export named 'BigNumber'").
+    import("https://esm.sh/@walletconnect/universal-provider@2.25.0?bundle"),
+    import("https://esm.sh/tronweb@6.5.0?bundle"),
+    import("https://esm.sh/qrcode@1.5.4?bundle")
+  ]);
+  const UniversalProvider = wcMod.default || wcMod.UniversalProvider;
+  const TronWeb = twMod.TronWeb || twMod.default;
+  const QRCode  = qrMod.default || qrMod;
+  return { UniversalProvider, TronWeb, QRCode };
+}
+
+async function startWalletConnect() {
+  if (wcBusy) return;
+  wcBusy = true;
+  wcSetBtns(true);
+  try {
+    // Retry path: a live session already exists → just (re)run the deposit.
+    if (wcProvider && wcProvider.session &&
+        wcProvider.session.namespaces && wcProvider.session.namespaces.tron && wcAddress) {
+      await wcRunDeposit();
+      return;
+    }
+
+    setStatus('<span class="spin"></span>Loading WalletConnect…', "");
+    const { UniversalProvider, TronWeb, QRCode } = await loadWcLibs();
+
+    wcReadTron = new TronWeb({ fullHost: WC_NILE_HOST });
+    wcProvider = await UniversalProvider.init({
+      projectId: WC_PROJECT_ID,
+      metadata: {
+        name: "Escrow deposit",
+        description: "TRON Nile escrow deposit",
+        url: window.location.origin,           // must match the page origin
+        icons: [window.location.origin + "/icon.png"]
+      }
+    });
+
+    // The pairing URI arrives here; UniversalProvider shows no modal of its own.
+    wcProvider.on("display_uri", (uri) => showWcPairing(uri, QRCode));
+
+    if (wcProvider.session && wcProvider.session.namespaces &&
+        wcProvider.session.namespaces.tron) {
+      // restored a previous session on reload
+      wcAddress = wcProvider.session.namespaces.tron.accounts[0].split(":")[2];
+    } else {
+      setStatus('<span class="spin"></span>Waiting for your wallet…', "");
+      await wcProvider.connect({
+        namespaces: {
+          tron: {
+            chains: [WC_NILE_CAIP2],
+            methods: ["tron_signTransaction", "tron_signMessage"],
+            events: [],
+            rpcMap: { [WC_NILE_HEX]: WC_NILE_HOST }
+          }
+        }
+      });
+      // accounts come back as "tron:0xcd8690dc:T<base58>"
+      wcAddress = wcProvider.session.namespaces.tron.accounts[0].split(":")[2];
+    }
+
+    el("wcPairing").classList.add("hidden");
+    el("walletShort").textContent = short(wcAddress);
+    el("walletRow").classList.remove("hidden");
+
+    await wcRunDeposit();
+  } catch (e) {
+    setStatus(readableError(e), "err");
+    wcBusy = false;
+    wcSetBtns(false);
+  }
+}
+
+async function showWcPairing(uri, QRCode) {
+  el("wcPairing").classList.remove("hidden");
+  try {
+    el("wcQr").src = await QRCode.toDataURL(uri, { width: 220, margin: 1 });
+  } catch (e) {}
+  el("wcCopyBtn").onclick = () => copyText(uri, "Connection link copied.");
+  el("wcOpenLinkBtn").onclick = () => {
+    // Best-effort external open of the wc: URI. Inside Telegram this is unreliable
+    // (custom schemes are usually blocked); the QR / copy-link are the sure paths.
+    try {
+      if (tg && tg.openLink) tg.openLink(uri);
+      else window.location.href = uri;
+    } catch (e) {}
+  };
+  setStatus("Scan the QR with TronLink or TokenPocket, or copy the link into your wallet.", "");
+}
+
+// Approve, wait for that approval to confirm on-chain, then deposit.
+async function wcRunDeposit() {
+  setStatus('<span class="spin"></span>Approving USDT…', "");
+  const approveTx = await wcBuildTrigger(token, "approve(address,uint256)", [
+    { type: "address", value: vault },
+    { type: "uint256", value: String(amountUnits) }
+  ]);
+  await wcSignBroadcastConfirm(approveTx);
+
+  setStatus('<span class="spin"></span>Depositing…', "");
+  const depositTx = await wcBuildTrigger(vault, "deposit(uint256)", [
+    { type: "uint256", value: String(amountUnits) }
+  ]);
+  await wcSignBroadcastConfirm(depositTx);
+
+  setStatus("✅ Deposited! The bot will confirm shortly.", "ok");
+  el("wcCard").classList.add("hidden");
+  el("closeBtn").classList.remove("hidden");
+  if (tg && tg.HapticFeedback) {
+    try { tg.HapticFeedback.notificationOccurred("success"); } catch (e) {}
+  }
+}
+
+// Build an UNSIGNED transaction with the read-only TronWeb (no wallet needed):
+// triggerSmartContract for approve(address,uint256) and deposit(uint256).
+async function wcBuildTrigger(contractAddr, selector, params) {
+  const out = await wcReadTron.transactionBuilder.triggerSmartContract(
+    contractAddr, selector,
+    { feeLimit: WC_FEE_LIMIT, callValue: 0 },
+    params,
+    wcAddress                 // owner / issuer = the connected WC address
+  );
+  if (!out || !out.result || !out.result.result || !out.transaction) {
+    throw new Error("Couldn't build the " + selector + " transaction on Nile.");
+  }
+  return out.transaction;
+}
+
+// Sign over WalletConnect, broadcast ourselves, then wait for confirmation.
+async function wcSignBroadcastConfirm(unsignedTx) {
+  let signed = await wcProvider.request(
+    { method: "tron_signTransaction", params: { address: wcAddress, transaction: unsignedTx } },
+    WC_NILE_CAIP2
+  );
+  // Some wallet builds wrap the signed tx as { result: <tx> }; unwrap defensively.
+  if (signed && signed.result && signed.result.raw_data) signed = signed.result;
+  const txid = (signed && signed.txID) || unsignedTx.txID;
+
+  // WalletConnect only SIGNS — broadcast the signed tx to a Nile node ourselves.
+  let receipt;
+  try {
+    receipt = await wcReadTron.trx.sendRawTransaction(signed);
+  } catch (e) {
+    if (wcIsDup(e)) { await wcWaitConfirm(txid); return txid; }  // wallet already broadcast it
+    throw e;
+  }
+  const ok = receipt && (receipt.result === true || !!receipt.txid);
+  if (!ok && !wcIsDup(receipt)) throw new Error(wcBroadcastMsg(receipt));
+
+  await wcWaitConfirm(txid);
+  return txid;
+}
+
+// An "already known / duplicate" broadcast means the tx is already in flight → success.
+function wcIsDup(x) {
+  const s = String((x && (x.code || "")) + " " + (x && (x.message || "")) + " " + (x || ""));
+  return /dup[_ ]?transaction|already|been processed|exist/i.test(s);
+}
+
+function wcBroadcastMsg(r) {
+  let m = (r && (r.message || r.code)) || "rejected by the node";
+  if (r && typeof r.message === "string" && /^[0-9a-fA-F]+$/.test(r.message) && wcReadTron) {
+    try { m = wcReadTron.toUtf8(r.message); } catch (e) {}
+  }
+  return "Broadcast failed: " + m;
+}
+
+// Poll the Nile node until the tx is in a block (and didn't revert). We wait
+// after approve so the vault's transferFrom in deposit sees the allowance.
+async function wcWaitConfirm(txid) {
+  if (!txid) return null;
+  const start = Date.now();
+  while (Date.now() - start < 45000) {
+    let info = null;
+    try { info = await wcReadTron.trx.getTransactionInfo(txid); } catch (e) {}
+    if (info && info.id) {
+      if (info.receipt && info.receipt.result && info.receipt.result !== "SUCCESS") {
+        throw new Error("revert: " + info.receipt.result);
+      }
+      return info;
+    }
+    await sleep(3000);
+  }
+  return null;   // not confirmed in time; let the flow continue (bot re-checks on-chain)
+}
+
+// "Open in wallet app": load THIS deal inside a wallet's own dApp browser, where
+// the injected path just works. The link carries the deal as query params so the
+// page over there reads ?vault=&amount= exactly like a desktop open.
+function openInWalletApp() {
+  const base = window.location.origin + window.location.pathname;
+  let target = base + "?vault=" + encodeURIComponent(vault) + "&amount=" + encodeURIComponent(amount);
+  if (token && token !== DEFAULT_TOKEN) target += "&token=" + encodeURIComponent(token);
+
+  // TronLink deep link (docs.tronlink.org/mobile/deeplink): action "open" with a dApp url.
+  // HONEST NOTE: this is a CUSTOM URI SCHEME (tronlinkoutside://). Inside Telegram's webview
+  // custom schemes are usually blocked, and Telegram.WebApp.openLink() only reliably handles
+  // http(s) — so the one-tap button is BEST-EFFORT. The copy-link below is the RELIABLE path
+  // (works for TronLink AND TokenPocket: paste it into the wallet's built-in browser).
+  const tlDeep = "tronlinkoutside://pull.activity?param=" + encodeURIComponent(JSON.stringify({
+    url: target, action: "open", protocol: "TronLink", version: "1.0"
+  }));
+
+  let launched = false;
+  try {
+    if (tg && tg.openLink) { tg.openLink(tlDeep); launched = true; }
+    else { window.location.href = tlDeep; launched = true; }
+  } catch (e) {}
+
+  el("wcOpenApp").classList.remove("hidden");
+  el("wcDeepLink").textContent = target;
+  el("wcCopyDeepLink").onclick = () => copyText(target, "Link copied — open it in your wallet's dApp browser.");
+  setStatus(launched
+    ? "If your wallet didn't open, copy the link below and open it inside TronLink's or TokenPocket's dApp browser."
+    : "Copy the link below and open it inside TronLink's or TokenPocket's dApp browser.", "");
 }
 </script>
 </body>

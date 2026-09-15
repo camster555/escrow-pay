@@ -49,6 +49,8 @@
     margin:2px 0 2px;
   }
   .amount small{font-size:16px;font-weight:600;color:var(--hint);margin-left:4px}
+  /* vote mode: the outcome this signature approves, in place of the deposit amount */
+  .vote-what{font-size:21px;font-weight:800;letter-spacing:-.3px;margin:2px 0;line-height:1.25}
   .label{color:var(--hint);font-size:13px;margin-top:14px}
   .addr-row{
     display:flex;
@@ -163,14 +165,23 @@
   <!-- Fatal error (missing params) replaces everything -->
   <div id="fatal" class="card error-box hidden"></div>
 
-  <!-- Main deposit UI -->
+  <!-- Main UI: deposit mode by default, vote mode when the link carries a vote -->
   <div id="main" class="hidden">
     <div class="card">
-      <h1>Escrow deposit</h1>
-      <p class="sub">Your USDT goes into this deal's own on-chain vault — it only moves when 2 of 3 (buyer, seller, arbiter) agree.</p>
+      <h1 id="cardTitle">Escrow deposit</h1>
+      <p class="sub" id="cardSub">Your USDT goes into this deal's own on-chain vault — it only moves when 2 of 3 (buyer, seller, arbiter) agree.</p>
 
-      <div class="label">You deposit</div>
-      <div class="amount"><span id="amt">—</span><small>USDT</small></div>
+      <!-- deposit mode: what you are paying in -->
+      <div id="depositBlock">
+        <div class="label">You deposit</div>
+        <div class="amount"><span id="amt">—</span><small>USDT</small></div>
+      </div>
+
+      <!-- vote mode: which outcome this signature approves -->
+      <div id="voteBlock" class="hidden">
+        <div class="label">You are voting for</div>
+        <div class="vote-what" id="voteWhat">—</div>
+      </div>
 
       <div class="label">Deal vault</div>
       <div class="addr-row">
@@ -256,11 +267,21 @@ const USDT_ABI = [
   }
 ];
 
-// Minimal Escrow (vault) ABI: deposit + a couple of views.
+// Minimal Escrow (vault) ABI: deposit, approve (the settlement vote) + a couple of views.
 const ESCROW_ABI = [
   {
     "inputs": [{ "name": "amount", "type": "uint256" }],
     "name": "deposit",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    // approve(uint8 mode) — the 2-of-3 settlement vote. 1=ReturnOwn, 2=ToBuyer,
+    // 3=ToSeller; two matching votes settle the vault on the spot. Only the buyer,
+    // seller or arbiter may call it, and only while the vault is Active.
+    "inputs": [{ "name": "mode", "type": "uint8" }],
+    "name": "approve",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -280,6 +301,21 @@ const ESCROW_ABI = [
     "type": "function"
   }
 ];
+
+// ---- Settlement votes -------------------------------------------------
+// Escrow.sol Mode: 1=ReturnOwn, 2=ToBuyer, 3=ToSeller. Keyed by STRING because the
+// mode arrives as text (deep-link tail / query param) and is sent to the contract as
+// text too — see the encoder note on USDT_ABI above.
+const VOTE_LABEL = {
+  "1": "Return each side's own deposit",
+  "2": "Refund the buyer",
+  "3": "Release to the seller"
+};
+const VOTE_BTN = {
+  "1": "Sign vote: return each side's own deposit",
+  "2": "Sign vote: refund the buyer",
+  "3": "Sign vote: release to seller"
+};
 
 // ---- Telegram integration --------------------------------------------
 const tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
@@ -338,29 +374,58 @@ function fatal(msg) {
 // the payload to us as WebApp.initDataUnsafe.start_param, i.e. the string "<vault>_<amount>".
 // Opening the hosted page directly (desktop TronLink / TronLink's browser) still uses the
 // plain ?vault=...&amount=... query, so both paths work.
+//
+// The "🔏 Sign vote in wallet" button uses the SAME mechanism with one extra tail:
+// <vault>_<amount>_v<mode>  (query form: &vote=<mode>). The tail turns this page into a
+// VOTE page. A payload without it is a deposit link and behaves exactly as it always has.
 const q = new URLSearchParams(location.search);
 const sp = ((window.Telegram && window.Telegram.WebApp
              && window.Telegram.WebApp.initDataUnsafe
              && window.Telegram.WebApp.initDataUnsafe.start_param) || "").trim();
-let vault, amount;
+let vault, amount, voteMode;
 if (sp) {
   const i = sp.indexOf("_");                 // vault is base58 (never contains "_"); amount follows
   vault  = (i >= 0 ? sp.slice(0, i) : sp).trim();
+  let rest = (i >= 0 ? sp.slice(i + 1) : "").trim();
+  const v = rest.lastIndexOf("_v");          // optional vote tail; the amount is digits + "-" only
+  if (v >= 0) {
+    voteMode = rest.slice(v + 2).trim();
+    rest = rest.slice(0, v);
+  }
   // startapp can't carry a "."; the bot sent a decimal amount's point as "-", so restore it.
-  amount = (i >= 0 ? sp.slice(i + 1) : "").trim().replace(/-/g, ".");
+  amount = rest.replace(/-/g, ".");
 } else {
-  vault  = (q.get("vault")  || "").trim();
-  amount = (q.get("amount") || "").trim();
+  vault    = (q.get("vault")  || "").trim();
+  amount   = (q.get("amount") || "").trim();
+  voteMode = (q.get("vote")   || "").trim();
 }
 const token = (q.get("token") || "").trim() || DEFAULT_TOKEN;
 
-if (!vault || !amount) {
+// Vote mode only when the link really carries one of the three contract modes.
+const isVote = !!voteMode && Object.prototype.hasOwnProperty.call(VOTE_LABEL, voteMode);
+
+if (!vault) {
+  fatal("This link is missing its deal details (the vault address). Please reopen the link the bot gave you.");
+} else if (voteMode && !isVote) {
+  fatal("This settlement link has an invalid vote. Please reopen the link the bot gave you.");
+} else if (!isVote && !amount) {
   fatal("This deposit link is missing its deal details (vault and amount). Please reopen the link the bot gave you.");
-} else if (isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+} else if (!isVote && (isNaN(parseFloat(amount)) || parseFloat(amount) <= 0)) {
   fatal("This deposit link has an invalid amount.");
 } else {
   el("main").classList.remove("hidden");
-  el("amt").textContent = amount;
+  if (isVote) {
+    // Same card, different job: show the OUTCOME being approved instead of an amount.
+    document.title = "Escrow settlement";
+    el("cardTitle").textContent = "Escrow settlement";
+    el("cardSub").textContent = "Signing casts your vote on this deal's on-chain vault. "
+      + "The money moves only when 2 of the 3 (buyer, seller, arbiter) approve the same outcome.";
+    el("depositBlock").classList.add("hidden");
+    el("voteBlock").classList.remove("hidden");
+    el("voteWhat").textContent = VOTE_LABEL[voteMode];
+  } else {
+    el("amt").textContent = amount;
+  }
   el("vaultShort").textContent = short(vault);
   el("copyVault").addEventListener("click", () => copyText(vault, "Vault address copied."));
   el("primaryBtn").textContent = "Connect wallet";
@@ -371,8 +436,14 @@ if (!vault || !amount) {
   checkVaultState();           // is this deal still open? (stale-link guard)
 }
 
-// USDT has 6 decimals.
-const amountUnits = Math.round(parseFloat(amount) * 1e6);
+// USDT has 6 decimals. A vote link carries the amount only so the card and the
+// "open in wallet app" link stay identical to the deposit one; it isn't used to sign.
+const amountUnits = amount ? Math.round(parseFloat(amount) * 1e6) : 0;
+
+// What the primary button does once a wallet is connected.
+function actionLabel() {
+  return isVote ? VOTE_BTN[voteMode] : ("Deposit " + amount + " USDT");
+}
 
 // ---- Stale-link guard -------------------------------------------------
 // A chat accumulates a deposit card per deal, so someone can scroll up and open an
@@ -401,21 +472,61 @@ async function readVaultState() {
   return parseInt(hex, 16);
 }
 
+// Which live vault states make THIS page's action impossible, as a plain sentence
+// (null = go ahead). One place, so the on-load guard and the re-check right before
+// signing always say exactly the same thing.
+//   deposit: Settled(2) / Cancelled(3) are dead vaults.
+//   vote:    same, PLUS AwaitingDeposit(0) — approve() requires Active, and there is
+//            nothing in the vault to release anyway.
+function blockedReason(st) {
+  if (st === 2) {
+    return "This deal has already been settled — "
+         + (isVote ? "there is nothing left to vote on." : "do not send funds to it.")
+         + " Open the most recent message in your chat instead.";
+  }
+  if (st === 3) {
+    return "This deal has been cancelled — "
+         + (isVote ? "there is nothing left to vote on." : "do not send funds to it.")
+         + " Open the most recent message in your chat instead.";
+  }
+  if (isVote && st === 0) {
+    return "Nothing has been deposited into this deal yet, so there is nothing to release. "
+         + "Once the buyer has paid in, vote again from the chat.";
+  }
+  return null;
+}
+
 async function checkVaultState() {
   try {
     vaultState = await readVaultState();
   } catch (e) {
     return;                            // network hiccup: stay silent, don't block paying
   }
-  if (vaultState === 2 || vaultState === 3) {
-    // finished deal -- block it outright so nobody pays into a dead vault
-    const what = vaultState === 2 ? "already been settled" : "been cancelled";
-    fatal("This deal has " + what + " — do not send funds to it. "
-          + "Open the most recent deposit message in your chat instead.");
-  } else if (vaultState === 1) {
+  const blocked = blockedReason(vaultState);
+  if (blocked) {
+    fatal(blocked);                    // dead vault -- block it outright
+  } else if (!isVote && vaultState === 1) {
     setStatus("Note: this deal already has a deposit recorded. "
               + "Only continue if you meant to add more.", "");
   }
+}
+
+// Re-check right before signing: the page may have sat open (or been reopened from an
+// OLD chat message) while the deal moved on. Better to stop here than to pay gas for a
+// transaction the contract will reject. Returns false when the action is blocked.
+async function guardState() {
+  let st;
+  try {
+    st = await readVaultState();
+  } catch (e) {
+    return true;                       // network hiccup -- let the contract decide
+  }
+  const blocked = blockedReason(st);
+  if (blocked) {
+    fatal(blocked);
+    return false;
+  }
+  return true;
 }
 
 function copyText(text, okMsg) {
@@ -505,8 +616,9 @@ async function connectWallet() {
   } catch (e) {}
 
   connected = true;
-  el("primaryBtn").textContent = "Deposit " + amount + " USDT";
-  setStatus("Wallet connected. Tap Deposit to fund the escrow.", "");
+  el("primaryBtn").textContent = actionLabel();
+  setStatus(isVote ? "Wallet connected. Tap to sign your vote."
+                   : "Wallet connected. Tap Deposit to fund the escrow.", "");
   return true;
 }
 
@@ -517,19 +629,8 @@ async function doDeposit() {
   el("primaryBtn").disabled = true;
 
   try {
-    // Re-check the deal is still open: the page may have sat open (or been reopened
-    // from an OLD chat message) while the deal got settled or cancelled. Better to
-    // stop here than to pay gas for a transaction the contract will reject.
-    try {
-      const st = await readVaultState();
-      if (st === 2 || st === 3) {
-        fatal("This deal has " + (st === 2 ? "already been settled" : "been cancelled")
-              + " — do not send funds to it. Open the most recent deposit message "
-              + "in your chat instead.");
-        busy = false;
-        return;
-      }
-    } catch (e) { /* network hiccup -- fall through and let the contract decide */ }
+    // Stale-link re-check (settled/cancelled deal) before paying any gas.
+    if (!(await guardState())) { busy = false; return; }
 
     // Step 1 — approve the vault to pull `amountUnits` USDT.
     setStatus('<span class="spin"></span>Approving…', "");
@@ -563,6 +664,41 @@ async function doDeposit() {
   }
 }
 
+// ---- Vote flow: one approve(mode) call on the vault -------------------
+// Same connected wallet, same contract object, one call instead of two. The 2-of-3
+// rule lives in the contract: when this vote matches another one, the vault settles
+// itself and chain_watcher posts the result in the chat.
+async function doVote() {
+  if (busy) return;
+  busy = true;
+  el("primaryBtn").disabled = true;
+
+  try {
+    if (!(await guardState())) { busy = false; return; }
+
+    setStatus('<span class="spin"></span>Signing your vote…', "");
+    // The mode goes over as a STRING for exactly the reason the deposit amount does
+    // (see the note on USDT_ABI): a raw JS Number can be mis-encoded by TronWeb.
+    const esc = await tronWeb.contract(ESCROW_ABI, vault);
+    await esc.approve(String(voteMode)).send({
+      feeLimit: 300000000,
+      shouldPollResponse: true
+    });
+
+    setStatus("✅ Vote signed on-chain. Once 2 of 3 agree, the vault pays out by itself "
+              + "— the bot posts the result in your chat.", "ok");
+    el("primaryBtn").classList.add("hidden");
+    el("closeBtn").classList.remove("hidden");
+    if (tg && tg.HapticFeedback) {
+      try { tg.HapticFeedback.notificationOccurred("success"); } catch (e) {}
+    }
+  } catch (e) {
+    setStatus(readableError(e), "err");
+    busy = false;
+    el("primaryBtn").disabled = false;
+  }
+}
+
 function readableError(e) {
   let msg = "";
   if (typeof e === "string") msg = e;
@@ -575,18 +711,31 @@ function readableError(e) {
   }
   if (low.indexOf("declined") !== -1 || low.indexOf("reject") !== -1 ||
       low.indexOf("cancel") !== -1 || low.indexOf("denied") !== -1) {
-    return "Transaction cancelled in your wallet. Tap Deposit to try again.";
+    return isVote ? "Transaction cancelled in your wallet. Tap the button to sign again."
+                  : "Transaction cancelled in your wallet. Tap Deposit to try again.";
   }
   if (low.indexOf("balance") !== -1 || low.indexOf("insufficient") !== -1) {
-    return "Not enough USDT (or TRX for fees) in your wallet on the Nile testnet.";
+    return isVote ? "Not enough TRX in this wallet to pay the Nile network fee."
+                  : "Not enough USDT (or TRX for fees) in your wallet on the Nile testnet.";
   }
   if (low.indexOf("revert") !== -1) {
+    if (isVote) {
+      return "The vote was rejected by the contract. This deal may already be settled, or "
+           + "this wallet isn't one of its three parties (buyer, seller, arbiter). " + msg;
+    }
     return "The deposit was rejected by the contract. This deal may not be open for deposits, or the amount doesn't match. " + msg;
   }
   return "Something went wrong: " + msg;
 }
 
 // ---- Primary button router -------------------------------------------
+// Connecting is identical for both modes; only the signed call differs, so the
+// wallet plumbing below is shared and this is the single fork.
+async function runAction() {
+  if (isVote) await doVote();
+  else        await doDeposit();
+}
+
 async function onPrimary() {
   if (busy) return;
   if (!connected) {
@@ -600,7 +749,7 @@ async function onPrimary() {
       showWalletOptions();
     }
   } else {
-    await doDeposit();
+    await runAction();
   }
 }
 
@@ -658,10 +807,10 @@ async function startWalletConnect() {
   wcBusy = true;
   wcSetBtns(true);
   try {
-    // Retry path: a live session already exists → just (re)run the deposit.
+    // Retry path: a live session already exists → just (re)run the action.
     if (wcProvider && wcProvider.session &&
         wcProvider.session.namespaces && wcProvider.session.namespaces.tron && wcAddress) {
-      await wcRunDeposit();
+      await wcRunAction();
       return;
     }
 
@@ -672,8 +821,8 @@ async function startWalletConnect() {
     wcProvider = await UniversalProvider.init({
       projectId: WC_PROJECT_ID,
       metadata: {
-        name: "Escrow deposit",
-        description: "TRON Nile escrow deposit",
+        name: isVote ? "Escrow settlement" : "Escrow deposit",
+        description: isVote ? "TRON Nile escrow settlement vote" : "TRON Nile escrow deposit",
         url: window.location.origin,           // must match the page origin
         icons: [window.location.origin + "/icon.png"]
       }
@@ -706,7 +855,7 @@ async function startWalletConnect() {
     el("walletShort").textContent = short(wcAddress);
     el("walletRow").classList.remove("hidden");
 
-    await wcRunDeposit();
+    await wcRunAction();
   } catch (e) {
     setStatus(readableError(e), "err");
     wcBusy = false;
@@ -729,6 +878,32 @@ async function showWcPairing(uri, QRCode) {
     } catch (e) {}
   };
   setStatus("Scan the QR with TronLink or TokenPocket, or copy the link into your wallet.", "");
+}
+
+// Same fork as runAction(), on the WalletConnect side: build → sign → broadcast is
+// shared (wcBuildTrigger / wcSignBroadcastConfirm), only the call differs.
+async function wcRunAction() {
+  if (isVote) await wcRunVote();
+  else        await wcRunDeposit();
+}
+
+// One approve(uint8) call, signed over WalletConnect and broadcast by us.
+async function wcRunVote() {
+  if (!(await guardState())) return;
+
+  setStatus('<span class="spin"></span>Signing your vote…', "");
+  const voteTx = await wcBuildTrigger(vault, "approve(uint8)", [
+    { type: "uint8", value: String(voteMode) }     // string, same encoder note as above
+  ]);
+  await wcSignBroadcastConfirm(voteTx);
+
+  setStatus("✅ Vote signed on-chain. Once 2 of 3 agree, the vault pays out by itself "
+            + "— the bot posts the result in your chat.", "ok");
+  el("wcCard").classList.add("hidden");
+  el("closeBtn").classList.remove("hidden");
+  if (tg && tg.HapticFeedback) {
+    try { tg.HapticFeedback.notificationOccurred("success"); } catch (e) {}
+  }
 }
 
 // Approve, wait for that approval to confirm on-chain, then deposit.
@@ -829,10 +1004,13 @@ async function wcWaitConfirm(txid) {
 
 // "Open in wallet app": load THIS deal inside a wallet's own dApp browser, where
 // the injected path just works. The link carries the deal as query params so the
-// page over there reads ?vault=&amount= exactly like a desktop open.
+// page over there reads ?vault=&amount=(&vote=) exactly like a desktop open --
+// the vote MUST come along, or the wallet's browser would show a deposit page.
 function openInWalletApp() {
   const base = window.location.origin + window.location.pathname;
-  let target = base + "?vault=" + encodeURIComponent(vault) + "&amount=" + encodeURIComponent(amount);
+  let target = base + "?vault=" + encodeURIComponent(vault);
+  if (amount) target += "&amount=" + encodeURIComponent(amount);
+  if (isVote) target += "&vote=" + encodeURIComponent(voteMode);
   if (token && token !== DEFAULT_TOKEN) target += "&token=" + encodeURIComponent(token);
 
   // TronLink deep link (docs.tronlink.org/mobile/deeplink): action "open" with a dApp url.
